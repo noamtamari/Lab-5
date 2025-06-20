@@ -1,0 +1,850 @@
+ELF Loader (loader.c) - Functionality and Detailed Documentation
+This document explains the functionality of each major section and function within the loader.c file, which is designed to act as a basic ELF executable loader for 32-bit static binaries on Linux. It includes detailed documentation for each function.
+
+1. Overall Purpose and Design
+The loader.c program is a custom ELF (Executable and Linkable Format) loader. Its primary goal is to manually parse a 32-bit static ELF executable, map its segments into the current process's memory space, prepare a suitable execution environment (stack with arguments and environment variables), and then transfer control to the loaded program's entry point.
+
+It operates in several distinct phases:
+
+Initialization and File Opening: Opens the target ELF file and gathers basic file information.
+
+ELF Header and Program Header Table Parsing: Temporarily maps the ELF file to read its headers and validate its format.
+
+Program Header Analysis and Mapping (Task 2b): Iterates through the Program Header Table, specifically identifying PT_LOAD segments, calculating their memory requirements, and using mmap to map them into the loader's address space at their specified virtual addresses. It also handles zeroing out the BSS (Block Started by Symbol) section.
+
+Static Link Check: Verifies that the target ELF is statically linked by checking for PT_DYNAMIC or PT_INTERP program headers.
+
+Control Transfer (Task 2d): Prepares the arguments and environment for the target program on a new stack and transfers execution to the target ELF's entry point by calling an external assembly startup() function.
+
+2. Functionality Breakdown (Part by Part Explanation)
+Let's break down the loader.c file into its major functional components.
+
+2.1. Header Includes and Global Definitions
+#ifndef _GNU_SOURCE // Enable GNU extensions for stat64, etc.
+#define _GNU_SOURCE
+#endif
+
+#include <stdio.h>    // For printf, perror, fprintf
+#include <stdlib.h>   // For exit, EXIT_FAILURE, EXIT_SUCCESS, malloc, free
+#include <string.h>   // For memcmp, memset, strlen, memcpy
+#include <sys/types.h> // For open, off_t
+#include <sys/stat.h> // For stat64, fstat64
+#include <fcntl.h>    // For open, O_RDONLY
+#include <sys/mman.h> // For mmap, munmap, PROT_*, MAP_*
+#include <unistd.h>   // For close, size_t, sysconf(_SC_PAGESIZE)
+
+// Ensure we have Elf32_Phdr and Elf32_Ehdr definitions.
+// On Linux, these are typically in <elf.h>.
+#include <elf.h>
+
+// To enable 64-bit file offsets on 32-bit systems,
+// define _FILE_OFFSET_BITS to 64 before including any headers.
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
+// Define a common stack size for the loaded program (Illustrative, startup.s handles it)
+#define LOADER_STACK_SIZE 0x100000 // 1MB for the loaded program's stack
+
+// External declaration for the current process's environment variables
+extern char **environ;
+
+// Global variable to hold the file descriptor of the target ELF for mmap operations
+static int g_target_elf_fd = -1;
+
+// --- External declaration for the startup function from startup.s ---
+// Based on the user's provided startup.s, it expects:
+// int startup(int argc_from_loader, char *argv_from_loader[], unsigned int func_to_call_addr);
+// It returns the exit status of the target program.
+extern int startup(int loader_argc, char *loader_argv[], unsigned int target_entry_point);
+
+#define _GNU_SOURCE: Enables various GNU extensions, including stat64 for handling large files on 32-bit systems.
+
+#include directives: Bring in standard C library functions (stdio.h, stdlib.h, string.h) and system-specific headers (sys/types.h, sys/stat.h, fcntl.h, sys/mman.h, unistd.h, elf.h) required for file operations, memory mapping, and ELF structure definitions.
+
+#define _FILE_OFFSET_BITS 64: Ensures off_t and related file offset types are 64-bit, allowing the loader to handle files larger than 2GB on 32-bit systems.
+
+LOADER_STACK_SIZE: Defines a constant for the base size of the stack allocated for the loaded program. While startup.s handles the stack setup, this provides a conceptual size.
+
+extern char **environ: Declares the global environ variable, which is an array of pointers to the environment strings for the current process. This is standard in C and allows the loader to access its own environment.
+
+g_target_elf_fd: A static global variable used to store the file descriptor of the target ELF. This is necessary because the foreach_phdr callback function (loader_map_callback) has a fixed signature and cannot directly pass additional arguments like the file descriptor to load_phdr.
+
+extern int startup(...): Declares the startup function, which is implemented in an external assembly file (startup.s). This function is the bridge to transfer control to the loaded ELF. Its signature is crucial: it expects the argc and argv from the loader's main and the target ELF's entry point. Crucially, it returns an integer (the exit status of the loaded program) back to the loader, meaning it does not directly jump without returning.
+
+2.2. Helper: get_phdr_type_string
+const char* get_phdr_type_string(Elf32_Word p_type) {
+    switch (p_type) {
+        case PT_NULL:    return "NULL";
+        case PT_LOAD:    return "LOAD";
+        case PT_DYNAMIC: return "DYNAMIC";
+        case PT_INTERP:  return "INTERP";
+        case PT_NOTE:    return "NOTE";
+        case PT_SHLIB:   return "SHLIB";
+        case PT_PHDR:    return "PHDR";
+        case PT_TLS:     return "TLS";
+        case PT_NUM:     return "NUM";
+        case PT_GNU_EH_FRAME: return "GNU_EH_FRAME";
+        case PT_GNU_STACK:    return "GNU_STACK";
+        case PT_GNU_RELRO:    return "GNU_RELRO";
+        default:         return "UNKNOWN";
+    }
+}
+
+Functionality: This utility function takes an ELF program header type (Elf32_Word p_type) as input and returns a human-readable string representation of that type. This is primarily used for printing informative output, mimicking the readelf -l command.
+
+2.3. Helper: print_readelf_phdr_info (Task 1a & 1b)
+void print_readelf_phdr_info(Elf32_Phdr *phdr, int index) {
+    if (phdr == NULL) {
+        fprintf(stderr, "Error: Passed NULL program header to print_readelf_phdr_info.\n");
+        return;
+    }
+
+    printf("%-8s ", get_phdr_type_string(phdr->p_type));
+    printf("0x%08x ", phdr->p_offset); // Offset
+    printf("0x%08x ", phdr->p_vaddr);  // VirtAddr
+    printf("0x%08x ", phdr->p_paddr);  // PhysAddr
+    printf("0x%07x ", phdr->p_filesz); // FileSiz
+    printf("0x%07x ", phdr->p_memsz);  // MemSiz
+
+    printf("%c%c%c ",
+           (phdr->p_flags & PF_R) ? 'R' : ' ',
+           (phdr->p_flags & PF_W) ? 'W' : ' ',
+           (phdr->p_flags & PF_X) ? 'E' : ' ');
+
+    printf("0x%x ", phdr->p_align);
+
+    if (phdr->p_type == PT_LOAD) {
+        int prot_flags = 0;
+        if (phdr->p_flags & PF_R) prot_flags |= PROT_READ;
+        if (phdr->p_flags & PF_W) prot_flags |= PROT_WRITE;
+        if (phdr->p_flags & PF_X) prot_flags |= PROT_EXEC;
+
+        printf("%s%s%s",
+               (prot_flags & PROT_READ)  ? "PROT_READ"  : "",
+               (prot_flags & PROT_WRITE) ? "|PROT_WRITE" : "",
+               (prot_flags & PROT_EXEC)  ? "|PROT_EXEC" : "");
+
+        if (prot_flags == 0) {
+            printf("0");
+        }
+        
+        printf(" MAP_PRIVATE|MAP_FIXED");
+    } else {
+        printf("-                        ");
+    }
+    printf("\n");
+}
+
+Functionality: This function prints detailed information about a given Elf32_Phdr (Program Header). It displays the segment type, file offset, virtual address, physical address, file size, memory size, flags (Read, Write, Execute), and alignment. For PT_LOAD segments, it also calculates and prints the corresponding mmap protection flags (PROT_READ, PROT_WRITE, PROT_EXEC) and common mapping flags (MAP_PRIVATE|MAP_FIXED). This fulfills the requirements for Task 1a and 1b.
+
+2.4. Core Logic: foreach_phdr (Task 0)
+int foreach_phdr(void *map_start, void (*func)(Elf32_Phdr *, int), int arg) {
+    Elf32_Ehdr *elf_header = (Elf32_Ehdr *)map_start;
+
+    if (memcmp(elf_header->e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "Error: Not an ELF file (bad magic number).\n");
+        return -1;
+    }
+    if (elf_header->e_ident[EI_CLASS] != ELFCLASS32) {
+        fprintf(stderr, "Error: Not a 32-bit ELF file. This loader only supports 32-bit.\n");
+        return -1;
+    }
+    if (elf_header->e_type != ET_EXEC && elf_header->e_type != ET_DYN) {
+        fprintf(stderr, "Error: Not an executable ELF file (e_type = %x).\n", elf_header->e_type);
+        return -1;
+    }
+
+    Elf32_Off phoff = elf_header->e_phoff;
+    Elf32_Half phnum = elf_header->e_phnum;
+    Elf32_Half phentsize = elf_header->e_phentsize;
+
+    if (phnum == 0) {
+        fprintf(stderr, "Warning: No program headers found in the ELF file.\n");
+        return 0;
+    }
+
+    Elf32_Phdr *current_phdr = (Elf32_Phdr *)((char *)map_start + phoff);
+    for (int i = 0; i < phnum; ++i) {
+        func(current_phdr, i);
+        current_phdr = (Elf32_Phdr *)((char *)current_phdr + phentsize);
+    }
+    return 0;
+}
+
+Functionality: This function iterates through the Program Header Table (PHT) of a given ELF file. It first performs basic validation of the ELF header (magic number, class, type). Then, it calculates the starting address of the PHT and iterates e_phnum times, calling a user-provided callback function (func) for each program header. This design allows different actions to be performed on each header (e.g., printing or mapping).
+
+2.5. Core Logic: load_phdr (Task 2b)
+void load_phdr(Elf32_Phdr *phdr, int fd) {
+    if (phdr == NULL) {
+        fprintf(stderr, "Error: load_phdr received NULL program header.\n");
+        return;
+    }
+
+    if (phdr->p_type == PT_LOAD) {
+        unsigned int vaddr = phdr->p_vaddr;
+        size_t mem_size = phdr->p_memsz;
+        off_t file_offset = phdr->p_offset;
+        size_t file_size_in_segment = phdr->p_filesz;
+
+        unsigned long page_size = sysconf(_SC_PAGESIZE);
+        unsigned long page_start_addr = vaddr & ~(page_size - 1);
+        unsigned long offset_in_page = vaddr & (page_size - 1);
+
+        unsigned long page_file_offset = file_offset & ~(page_size - 1);
+
+        size_t map_len = file_size_in_segment + offset_in_page;
+        map_len = (map_len + page_size - 1) & ~(page_size - 1);
+
+        int prot_flags = 0;
+        if (phdr->p_flags & PF_R) prot_flags |= PROT_READ;
+        if (phdr->p_flags & PF_W) prot_flags |= PROT_WRITE;
+        if (phdr->p_flags & PF_X) prot_flags |= PROT_EXEC;
+
+        int map_flags = MAP_PRIVATE | MAP_FIXED;
+
+        void *mapped_region = mmap((void *)page_start_addr, map_len, prot_flags, map_flags, fd, page_file_offset);
+        printf("Mapped segment at 0x%lx (len 0x%lx) for entry check\n", page_start_addr, map_len);
+
+        if (mapped_region == MAP_FAILED) {
+            perror("Error mapping segment in load_phdr");
+            fprintf(stderr, "Failed to map segment VAddr: 0x%x, FileSiz: 0x%x, MemSiz: 0x%x, Offset: 0x%x\n",
+                    vaddr, (unsigned int)file_size_in_segment, (unsigned int)mem_size, (unsigned int)file_offset);
+            exit(EXIT_FAILURE);
+        }
+        
+        printf("Mapped PT_LOAD segment: VAddr: 0x%x (Page Aligned: 0x%lx), Map Len: 0x%lx\n",
+               vaddr, page_start_addr, map_len);
+
+        unsigned long zero_start_addr = vaddr + file_size_in_segment;
+        unsigned long zero_end_addr = vaddr + mem_size;
+
+        if (zero_end_addr > zero_start_addr) {
+            size_t zero_size = zero_end_addr - zero_start_addr;
+            printf("Zeroing BSS from 0x%lx for 0x%lx bytes\n", zero_start_addr, zero_size);
+            memset((void *)zero_start_addr, 0, zero_size);
+        }
+    }
+}
+
+Functionality: This function is responsible for mapping a single PT_LOAD program segment into memory.
+
+It retrieves the virtual address (p_vaddr), memory size (p_memsz), file offset (p_offset), and file size (p_filesz) from the phdr struct.
+
+It then calculates page-aligned addresses and lengths for the mmap system call, as mmap requires page-aligned inputs.
+
+It determines the appropriate memory protection flags (PROT_READ, PROT_WRITE, PROT_EXEC) based on the segment's flags.
+
+It uses mmap with MAP_PRIVATE (changes are private to this process) and MAP_FIXED (map at the exact specified virtual address, crucial for correct ELF loading).
+
+BSS Zeroing: If p_memsz is greater than p_filesz, it means the segment has a BSS (Block Started by Symbol) section, which must be zero-initialized. The function uses memset to clear this additional memory space.
+
+Includes error handling for mmap failures.
+
+2.6. Wrapper: loader_map_callback
+void loader_map_callback(Elf32_Phdr *phdr, int index) {
+    load_phdr(phdr, g_target_elf_fd);
+}
+
+Functionality: This is a simple wrapper function. It acts as the callback for foreach_phdr when performing segment mapping. Since foreach_phdr's callback signature doesn't allow passing arbitrary extra data (like the file descriptor), this wrapper accesses the global g_target_elf_fd and passes it along with the phdr to the load_phdr function.
+
+2.7. Control Transfer: execute_loaded_elf (Task 2d)
+__attribute__((noreturn))
+void execute_loaded_elf(Elf32_Ehdr *elf_header, int loader_argc, char *loader_argv[]) {
+    unsigned int entry = elf_header->e_entry;
+    
+    // Prepare argc and argv for the loaded program
+    // The loaded program should see: test_args hello world 123
+    // So we need to skip the loader name and pass the rest
+    int target_argc = loader_argc - 1;  // Skip "./loader"
+    char **target_argv = &loader_argv[1];   // Point to "test_args"
+    
+    printf("Transferring control to 0x%x with argc=%d\n", entry, target_argc);
+    printf("Entry point address: 0x%x\n", elf_header->e_entry);
+    
+    // Print arguments being passed
+    printf("Arguments being passed to loaded program:\n");
+    for (int i = 0; i < target_argc; i++) {
+        printf("    argv[%d] = \"%s\"\n", i, target_argv[i]);
+    }
+    
+    // Call startup with correct signature: startup(argc, argv, entry)
+    startup(target_argc, target_argv, entry);
+    __builtin_unreachable();
+}
+
+Functionality: This function is responsible for preparing the arguments for the target ELF program and then initiating the transfer of control.
+
+It determines target_argc (the number of arguments the loaded program should receive) by subtracting 1 from loader_argc (to exclude the loader's own name).
+
+It calculates target_argv by pointing to the second element of loader_argv (which is the name of the target ELF program).
+
+It prints debugging information about the target entry point and the arguments that will be passed.
+
+startup(target_argc, target_argv, entry);: This is the critical call to the assembly startup function. This startup.s is expected to take these arguments, construct the full argc/argv/envp stack for the target program, switch the stack, and then jump to entry.
+
+__attribute__((noreturn)) and __builtin_unreachable(): These tell the compiler that this function is not expected to return, as control is transferred to another executable.
+
+2.8. Main Function
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <32bit_ELF_executable_file> [args_for_loaded_program...]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const char *file_path = argv[1];
+    int fd = -1;
+    struct stat64 st;
+    void *map_start_for_headers = NULL;
+
+    fd = open(file_path, O_RDONLY);
+    if (fd == -1) {
+        perror("Error opening ELF file");
+        return EXIT_FAILURE;
+    }
+    g_target_elf_fd = fd;
+
+    if (fstat64(fd, &st) == -1) {
+        perror("Error getting ELF file size");
+        return EXIT_FAILURE;
+    }
+
+    map_start_for_headers = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_start_for_headers == MAP_FAILED) {
+        perror("Error mapping ELF file for header parsing");
+        return EXIT_FAILURE;
+    }
+
+    Elf32_Ehdr *elf_header = (Elf32_Ehdr *)map_start_for_headers;
+
+    printf("--- Task 1a/1b: Program Header Information (All Headers) ---\n");
+    printf("Type     Offset   VirtAddr   PhysAddr   FileSiz  MemSiz   Flg Align   Prot Flags       Map Flags\n");
+    foreach_phdr(map_start_for_headers, print_readelf_phdr_info, 0);
+    printf("----------------------------------------------------------\n\n");
+
+    Elf32_Phdr *current_phdr_check = (Elf32_Phdr *)((char *)map_start_for_headers + elf_header->e_phoff);
+    for (int i = 0; i < elf_header->e_phnum; ++i) {
+        if (current_phdr_check->p_type == PT_DYNAMIC || current_phdr_check->p_type == PT_INTERP) {
+            fprintf(stderr, "Error: This loader only supports static linked executables. Found %s program header.\n",
+                    get_phdr_type_string(current_phdr_check->p_type));
+            munmap(map_start_for_headers, st.st_size);
+            close(fd);
+            return EXIT_FAILURE;
+        }
+        current_phdr_check = (Elf32_Phdr *)((char *)current_phdr_check + elf_header->e_phentsize);
+    }
+
+    printf("--- Task 2b: Mapping PT_LOAD segments ---\n");
+    foreach_phdr(map_start_for_headers, loader_map_callback, 0);
+    printf("----------------------------------------\n\n");
+
+    printf("--- Transferring Control ---\n");
+    execute_loaded_elf(elf_header, argc, argv);
+    printf("----------------------------\n");
+
+    if (map_start_for_headers != MAP_FAILED) {
+        if (munmap(map_start_for_headers, st.st_size) == -1) {
+            perror("Error unmapping temporary header map");
+        }
+    }
+    if (fd != -1) {
+        if (close(fd) == -1) {
+            perror("Error closing ELF file descriptor");
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+Functionality: This is the entry point of the loader program.
+
+Argument Check: Verifies that at least one argument (the path to the target ELF) is provided.
+
+File Handling: Opens the target ELF file using open() and gets its size using fstat64(). Stores the file descriptor in g_target_elf_fd.
+
+Header Mapping: Temporarily maps the entire ELF file into memory using mmap() with PROT_READ and MAP_PRIVATE flags. This temporary mapping is used only for reading the ELF header and program headers, not for execution.
+
+Header Information Print: Calls foreach_phdr with print_readelf_phdr_info to display details of all program headers (Task 1a/1b).
+
+Static Link Check (Task 2): Iterates through program headers to explicitly check for PT_DYNAMIC or PT_INTERP segments. If found, it indicates a dynamically linked executable, which this loader does not support, and it exits with an error.
+
+Segment Mapping (Task 2b): Calls foreach_phdr again, this time with loader_map_callback (which internally calls load_phdr) to map all PT_LOAD segments into memory at their specified virtual addresses.
+
+Control Transfer (Task 2d): Calls execute_loaded_elf, passing the ELF header (for the entry point) and the loader's argc/argv (for target program's arguments).
+
+Cleanup: Although control is transferred, the munmap and close calls are included for completeness, especially for error paths if the loading process fails before the final jump. The exit(exit_status) in execute_loaded_elf means these cleanup lines are generally unreachable on successful execution.
+
+3. Detailed Documentation for loader.c
+This section provides comprehensive Doxygen-style documentation for the entire loader.c file.
+
+/**
+ * @file loader.c
+ * @brief A basic ELF (Executable and Linkable Format) loader for 32-bit static binaries on Linux.
+ *
+ * This program demonstrates the core principles of an ELF loader:
+ * 1. Parsing ELF headers and program headers.
+ * 2. Mapping program segments into the current process's address space using mmap.
+ * 3. Handling BSS (Block Started by Symbol) zero-initialization.
+ * 4. Preparing the execution environment (stack, arguments, environment variables).
+ * 5. Transferring control to the loaded program's entry point.
+ *
+ * It is designed to load statically linked 32-bit ELF executables only.
+ *
+ * @author Noam
+ * @date June 2025
+ */
+
+#ifndef _GNU_SOURCE // Enable GNU extensions for stat64, etc.
+#define _GNU_SOURCE
+#endif
+
+#include <stdio.h>    // For printf, perror, fprintf
+#include <stdlib.h>   // For exit, EXIT_FAILURE, EXIT_SUCCESS, malloc, free
+#include <string.h>   // For memcmp, memset, strlen, memcpy
+#include <sys/types.h> // For open, off_t
+#include <sys/stat.h> // For stat64, fstat64
+#include <fcntl.h>    // For open, O_RDONLY
+#include <sys/mman.h> // For mmap, munmap, PROT_*, MAP_*
+#include <unistd.h>   // For close, size_t, sysconf(_SC_PAGESIZE)
+
+// Ensure we have Elf32_Phdr and Elf32_Ehdr definitions.
+// On Linux, these are typically in <elf.h>.
+#include <elf.h>
+
+// To enable 64-bit file offsets on 32-bit systems,
+// define _FILE_OFFSET_BITS to 64 before including any headers.
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
+/**
+ * @brief Defines the common stack size for the loaded program.
+ * This is an illustrative size for the memory region allocated for the target's stack.
+ * The actual stack preparation and sizing logic is primarily handled by the `startup.s` assembly.
+ */
+#define LOADER_STACK_SIZE 0x100000 // 1MB for the loaded program's stack
+
+/**
+ * @brief External declaration for the current process's environment variables.
+ * This global variable points to an array of strings, each representing an
+ * environment variable in the format "NAME=VALUE". The array is terminated by a NULL pointer.
+ */
+extern char **environ;
+
+/**
+ * @brief Global variable to hold the file descriptor of the target ELF for mmap operations.
+ * This is used to pass the file descriptor to the `load_phdr` function via the
+ * `foreach_phdr` callback mechanism, as the callback signature is fixed.
+ */
+static int g_target_elf_fd = -1;
+
+/**
+ * @brief External declaration for the startup function from `startup.s`.
+ *
+ * This assembly function is responsible for:
+ * 1. Receiving the `argc`, `argv` (from the loader's command line) and the
+ * target ELF's entry point address from `loader.c`.
+ * 2. Allocating or identifying a new stack region for the target ELF.
+ * 3. Populating this new stack with the correct `argc`, `argv` (adjusted for the target),
+ * and `envp` arrays, followed by their NULL terminators, and potentially an auxiliary vector.
+ * 4. Transferring control (jumping) to the target ELF's entry point (`_start`).
+ * 5. If the target program terminates gracefully (e.g., via `exit()` syscall),
+ * control typically does not return to this `startup` function in a true kernel.
+ * However, in this simulated environment, `startup.s` is designed to `call`
+ * the target and `ret` back, returning the target's exit status.
+ *
+ * @param loader_argc The argc count received by the loader's main function.
+ * @param loader_argv An array of strings (argv) received by the loader's main function.
+ * @param target_entry_point The virtual address of the target ELF's entry point (`e_entry`).
+ * @return Returns the exit status of the loaded program, as returned by the `startup.s` assembly.
+ */
+extern int startup(int loader_argc, char *loader_argv[], unsigned int target_entry_point);
+
+
+/**
+ * @brief Converts an ELF program header type to its human-readable string representation.
+ *
+ * This helper function aids in debugging and providing informative output by mapping
+ * numeric program header types (e.g., `PT_LOAD`, `PT_DYNAMIC`) to their
+ * corresponding string names.
+ *
+ * @param p_type The numeric program header type from `Elf32_Phdr.p_type`.
+ * @return A constant string representing the program header type. Returns "UNKNOWN" for unrecognized types.
+ */
+const char* get_phdr_type_string(Elf32_Word p_type) {
+    switch (p_type) {
+        case PT_NULL:    return "NULL";
+        case PT_LOAD:    return "LOAD";
+        case PT_DYNAMIC: return "DYNAMIC";
+        case PT_INTERP:  return "INTERP";
+        case PT_NOTE:    return "NOTE";
+        case PT_SHLIB:   return "SHLIB";
+        case PT_PHDR:    return "PHDR";
+        case PT_TLS:     return "TLS";
+        case PT_NUM:     return "NUM";
+        case PT_GNU_EH_FRAME: return "GNU_EH_FRAME";
+        case PT_GNU_STACK:    return "GNU_STACK";
+        case PT_GNU_RELRO:    return "GNU_RELRO";
+        default:         return "UNKNOWN";
+    }
+}
+
+/**
+ * @brief Prints detailed information about a single ELF program header. (Task 1a & 1b)
+ *
+ * This function formats and prints various fields of an `Elf32_Phdr` struct,
+ * including its type, offsets, virtual/physical addresses, sizes, flags, and alignment.
+ * For `PT_LOAD` segments, it also calculates and displays the corresponding `mmap`
+ * protection flags (PROT_READ, PROT_WRITE, PROT_EXEC) and mapping flags (MAP_PRIVATE|MAP_FIXED).
+ *
+ * @param phdr A pointer to the `Elf32_Phdr` structure to be printed.
+ * @param index The index of the program header in the Program Header Table (for debugging purposes).
+ * This argument is not directly used by this function's logic.
+ */
+void print_readelf_phdr_info(Elf32_Phdr *phdr, int index) {
+    if (phdr == NULL) {
+        fprintf(stderr, "Error: Passed NULL program header to print_readelf_phdr_info.\n");
+        return;
+    }
+
+    printf("%-8s ", get_phdr_type_string(phdr->p_type));
+    printf("0x%08x ", phdr->p_offset); // Offset
+    printf("0x%08x ", phdr->p_vaddr);  // VirtAddr
+    printf("0x%08x ", phdr->p_paddr);  // PhysAddr
+    printf("0x%07x ", phdr->p_filesz); // FileSiz
+    printf("0x%07x ", phdr->p_memsz);  // MemSiz
+
+    printf("%c%c%c ",
+           (phdr->p_flags & PF_R) ? 'R' : ' ',
+           (phdr->p_flags & PF_W) ? 'W' : ' ',
+           (phdr->p_flags & PF_X) ? 'E' : ' ');
+
+    printf("0x%x ", phdr->p_align);
+
+    if (phdr->p_type == PT_LOAD) {
+        int prot_flags = 0;
+        if (phdr->p_flags & PF_R) prot_flags |= PROT_READ;
+        if (phdr->p_flags & PF_W) prot_flags |= PROT_WRITE;
+        if (phdr->p_flags & PF_X) prot_flags |= PROT_EXEC;
+
+        printf("%s%s%s",
+               (prot_flags & PROT_READ)  ? "PROT_READ"  : "",
+               (prot_flags & PROT_WRITE) ? "|PROT_WRITE" : "",
+               (prot_flags & PROT_EXEC)  ? "|PROT_EXEC" : "");
+
+        if (prot_flags == 0) {
+            printf("0");
+        }
+        
+        printf(" MAP_PRIVATE|MAP_FIXED");
+    } else {
+        printf("-                        ");
+    }
+    printf("\n");
+}
+
+
+/**
+ * @brief Iterates over the program headers of a mapped ELF file and applies a callback function. (Task 0)
+ *
+ * This function validates the ELF header (magic number, class, type) and then
+ * traverses the Program Header Table. For each program header found, it invokes
+ * the provided callback function `func`.
+ *
+ * @param map_start A pointer to the base address where the ELF file's headers
+ * are temporarily mapped in memory.
+ * @param func A pointer to a callback function (`void (*func)(Elf32_Phdr *, int)`)
+ * that will be called for each program header.
+ * @param arg An integer argument that is typically unused by the callback function's logic
+ * but matches the `foreach_phdr` original signature (from Task 0).
+ * @return 0 on success, -1 if the file is not a valid 32-bit executable ELF.
+ */
+int foreach_phdr(void *map_start, void (*func)(Elf32_Phdr *, int), int arg) {
+    Elf32_Ehdr *elf_header = (Elf32_Ehdr *)map_start;
+
+    // Validate ELF magic number
+    if (memcmp(elf_header->e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "Error: Not an ELF file (bad magic number).\n");
+        return -1;
+    }
+    // Validate ELF class (must be 32-bit)
+    if (elf_header->e_ident[EI_CLASS] != ELFCLASS32) {
+        fprintf(stderr, "Error: Not a 32-bit ELF file. This loader only supports 32-bit.\n");
+        return -1;
+    }
+    // Validate ELF type (must be executable or dynamic for program headers to be meaningful)
+    if (elf_header->e_type != ET_EXEC && elf_header->e_type != ET_DYN) {
+        fprintf(stderr, "Error: Not an executable ELF file (e_type = %x).\n", elf_header->e_type);
+        return -1;
+    }
+
+    Elf32_Off phoff = elf_header->e_phoff;     // Offset of the Program Header Table
+    Elf32_Half phnum = elf_header->e_phnum;   // Number of program headers
+    Elf32_Half phentsize = elf_header->e_phentsize; // Size of each program header entry
+
+    if (phnum == 0) {
+        fprintf(stderr, "Warning: No program headers found in the ELF file.\n");
+        return 0;
+    }
+
+    // Calculate the start address of the Program Header Table
+    Elf32_Phdr *current_phdr = (Elf32_Phdr *)((char *)map_start + phoff);
+    for (int i = 0; i < phnum; ++i) {
+        func(current_phdr, i); // Call the provided function for each program header
+        current_phdr = (Elf32_Phdr *)((char *)current_phdr + phentsize); // Move to the next header
+    }
+    return 0;
+}
+
+/**
+ * @brief Maps a single `PT_LOAD` program header segment into memory. (Task 2b)
+ *
+ * This function calculates the necessary page-aligned addresses and sizes,
+ * determines the appropriate memory protection flags (read, write, execute),
+ * and uses `mmap` to map the segment into the current process's address space.
+ * It also handles the zero-initialization of the BSS portion of the segment
+ * (`p_memsz` - `p_filesz`).
+ *
+ * @param phdr A pointer to the `Elf32_Phdr` structure describing the segment to be mapped.
+ * @param fd The file descriptor of the ELF executable from which the segment data is read.
+ * @note This function will `exit(EXIT_FAILURE)` if `mmap` fails, as it's a critical error.
+ */
+void load_phdr(Elf32_Phdr *phdr, int fd) {
+    if (phdr == NULL) {
+        fprintf(stderr, "Error: load_phdr received NULL program header.\n");
+        return;
+    }
+
+    // Only process PT_LOAD segments, which contain data to be loaded into memory.
+    if (phdr->p_type == PT_LOAD) {
+        unsigned int vaddr = phdr->p_vaddr;                 // Virtual address where segment should be loaded
+        size_t mem_size = phdr->p_memsz;                    // Total size of segment in memory
+        off_t file_offset = phdr->p_offset;                 // Offset of segment data in the ELF file
+        size_t file_size_in_segment = phdr->p_filesz;       // Size of segment data in the ELF file
+
+        unsigned long page_size = sysconf(_SC_PAGESIZE);    // Get system's page size
+        // Calculate page-aligned start address for mmap. Segments might not start on page boundaries.
+        unsigned long page_start_addr = vaddr & ~(page_size - 1);
+        // Calculate the offset of the segment's `vaddr` within its starting page.
+        unsigned long offset_in_page = vaddr & (page_size - 1);
+
+        // Calculate page-aligned file offset for mmap.
+        unsigned long page_file_offset = file_offset & ~(page_size - 1);
+
+        // Calculate the total length of the memory region to map.
+        // It must cover the file content plus any initial alignment padding needed
+        // to map to the correct virtual address.
+        size_t map_len = file_size_in_segment + offset_in_page;
+        // Round up the map length to the nearest page size.
+        map_len = (map_len + page_size - 1) & ~(page_size - 1);
+
+        // Determine memory protection flags based on ELF segment flags
+        int prot_flags = 0;
+        if (phdr->p_flags & PF_R) prot_flags |= PROT_READ;
+        if (phdr->p_flags & PF_W) prot_flags |= PROT_WRITE;
+        if (phdr->p_flags & PF_X) prot_flags |= PROT_EXEC;
+
+        // MAP_PRIVATE: Changes made to the mapped region are not written back to the file.
+        // MAP_FIXED: Attempt to map the region at the exact `page_start_addr`. This is crucial
+        //            for loaders to ensure segments are placed at their specified virtual addresses.
+        int map_flags = MAP_PRIVATE | MAP_FIXED;
+
+        // Perform the memory mapping
+        void *mapped_region = mmap((void *)page_start_addr, map_len, prot_flags, map_flags, fd, page_file_offset);
+        
+        printf("Mapped segment at 0x%lx (len 0x%lx) for entry check\n", page_start_addr, map_len); // Debug print
+        if (mapped_region == MAP_FAILED) {
+            perror("Error mapping segment in load_phdr");
+            fprintf(stderr, "Failed to map segment VAddr: 0x%x, FileSiz: 0x%x, MemSiz: 0x%x, Offset: 0x%x\n",
+                    vaddr, (unsigned int)file_size_in_segment, (unsigned int)mem_size, (unsigned int)file_offset);
+            exit(EXIT_FAILURE); // Critical error, terminate loader
+        }
+        
+        printf("Mapped PT_LOAD segment: VAddr: 0x%x (Page Aligned: 0x%lx), Map Len: 0x%lx\n",
+               vaddr, page_start_addr, map_len);
+
+        // Zero-initialize the BSS portion of the segment.
+        // The BSS segment starts after the file-backed portion ends and extends up to `p_memsz`.
+        unsigned long zero_start_addr = vaddr + file_size_in_segment;
+        unsigned long zero_end_addr = vaddr + mem_size;
+
+        if (zero_end_addr > zero_start_addr) {
+            size_t zero_size = zero_end_addr - zero_start_addr;
+            printf("Zeroing BSS from 0x%lx for 0x%lx bytes\n", zero_start_addr, zero_size);
+            memset((void *)zero_start_addr, 0, zero_size); // Set memory to 0
+        }
+    }
+}
+
+/**
+ * @brief Wrapper function to call `load_phdr` within a `foreach_phdr` loop.
+ *
+ * This function exists because `foreach_phdr` has a fixed callback signature
+ * (`void (*func)(Elf32_Phdr *, int)`) and cannot directly pass the file descriptor (`fd`)
+ * required by `load_phdr`. It uses the global `g_target_elf_fd` to provide the file descriptor.
+ *
+ * @param phdr A pointer to the `Elf32_Phdr` structure to be passed to `load_phdr`.
+ * @param index The index of the program header (unused by `load_phdr` but required by `foreach_phdr`).
+ */
+void loader_map_callback(Elf32_Phdr *phdr, int index) {
+    load_phdr(phdr, g_target_elf_fd);
+}
+
+/**
+ * @brief Prepares arguments and transfers control to the loaded ELF program. (Task 2d)
+ *
+ * This function orchestrates the final steps before executing the target ELF:
+ * 1. Calculates the `argc` and `argv` that the *target program* should receive.
+ * 2. Prints debugging information about the impending transfer.
+ * 3. Calls the external `startup()` assembly function to perform the actual
+ * stack setup for the target program (including `argc`, `argv`, `envp`)
+ * and jump to its entry point.
+ *
+ * @param elf_header A pointer to the `Elf32_Ehdr` of the loaded ELF, containing its entry point.
+ * @param loader_argc The `argc` received by the loader's own `main` function.
+ * @param loader_argv The `argv` array received by the loader's own `main` function.
+ * @note This function is marked `__attribute__((noreturn))` because, upon successful
+ * transfer of control, the loader's execution path is terminated, and it does not return.
+ * If the `startup.s` returns, it implies the loaded program finished, and `execute_loaded_elf`
+ * then handles the exit status. `__builtin_unreachable()` is used to indicate this to the compiler.
+ */
+// Removed __attribute__((noreturn)) as per current `startup.s` which returns.
+// Re-added __attribute__((noreturn)) as the intent is to jump, and the provided
+// `startup.s` when working correctly (or as designed for ultimate jump) will not return.
+__attribute__((noreturn))
+void execute_loaded_elf(Elf32_Ehdr *elf_header, int loader_argc, char *loader_argv[]) {
+    unsigned int entry = elf_header->e_entry; // Get the target program's entry point
+
+    // Calculate argc and argv for the loaded program.
+    // loader_argv[0] is "./loader"
+    // loader_argv[1] is "./test_args" (this should be target_argv[0])
+    // loader_argv[2] is "hello"       (this should be target_argv[1])
+    // ...
+    int target_argc = loader_argc - 1;  // Subtract the loader's own name
+    char **target_argv = &loader_argv[1];   // Point to the target program's name in the array
+    
+    printf("Transferring control to 0x%x with argc=%d\n", entry, target_argc);
+    printf("Entry point address: 0x%x\n", elf_header->e_entry);
+    
+    printf("Arguments being passed to loaded program:\n");
+    for (int i = 0; i < target_argc; i++) {
+        printf("    argv[%d] = \"%s\"\n", i, target_argv[i]);
+    }
+    
+    // Call the assembly startup function.
+    // This function will set up the new stack for the target program
+    // using target_argc and target_argv, and then jump to `entry`.
+    startup(target_argc, target_argv, entry);
+    
+    // This line should technically be unreachable if startup performs a direct jump.
+    // __builtin_unreachable() is a GCC extension to tell the compiler this.
+    __builtin_unreachable(); 
+}
+
+/**
+ * @brief Main entry point of the ELF loader program.
+ *
+ * This function orchestrates the entire ELF loading process:
+ * 1. Validates command-line arguments.
+ * 2. Opens and temporarily maps the target ELF file to read its headers.
+ * 3. Prints program header information (Task 1a/1b).
+ * 4. Checks if the target ELF is statically linked (Task 2).
+ * 5. Maps the `PT_LOAD` segments into memory (Task 2b).
+ * 6. Transfers control to the loaded ELF program (Task 2d).
+ * 7. Handles cleanup (unmapping memory, closing file descriptor) if control returns or on error.
+ *
+ * @param argc The number of command-line arguments passed to the loader.
+ * @param argv An array of strings, where each string is a command-line argument.
+ * `argv[0]` is the loader's name, `argv[1]` is the target ELF path,
+ * and subsequent arguments are for the target ELF.
+ * @return `EXIT_SUCCESS` on successful loading and execution (though typically
+ * control is transferred and this function doesn't return on success),
+ * or `EXIT_FAILURE` on error.
+ */
+int main(int argc, char *argv[]) {
+    // Basic argument count check for the loader itself
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <32bit_ELF_executable_file> [args_for_loaded_program...]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const char *file_path = argv[1]; // Path to the target ELF executable
+    int fd = -1;                     // File descriptor for the target ELF
+    struct stat64 st;                // Structure to hold file status (including size)
+    void *map_start_for_headers = NULL; // Pointer to temporarily mapped ELF file for header parsing
+
+    // 1. Open the target ELF file for reading
+    fd = open(file_path, O_RDONLY);
+    if (fd == -1) {
+        perror("Error opening ELF file");
+        return EXIT_FAILURE;
+    }
+    g_target_elf_fd = fd; // Store file descriptor globally for load_phdr
+
+    // 2. Get the size of the ELF file
+    if (fstat64(fd, &st) == -1) {
+        perror("Error getting ELF file size");
+        close(fd); // Close file descriptor on error
+        return EXIT_FAILURE;
+    }
+
+    // 3. Memory map the entire ELF file temporarily for header parsing
+    // PROT_READ: Allows reading from the mapped region.
+    // MAP_PRIVATE: Changes to the mapped memory are not visible to other processes or written back to the file.
+    map_start_for_headers = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map_start_for_headers == MAP_FAILED) {
+        perror("Error mapping ELF file for header parsing");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    // Cast the mapped region to an ELF Header structure
+    Elf32_Ehdr *elf_header = (Elf32_Ehdr *)map_start_for_headers;
+
+    // --- Task 1a/1b: Print Program Header Information for all headers ---
+    printf("--- Task 1a/1b: Program Header Information (All Headers) ---\n");
+    printf("Type     Offset   VirtAddr   PhysAddr   FileSiz  MemSiz   Flg Align   Prot Flags       Map Flags\n");
+    // Iterate through program headers and print their details
+    foreach_phdr(map_start_for_headers, print_readelf_phdr_info, 0);
+    printf("----------------------------------------------------------\n\n");
+
+    // --- Task 2: Check for DYNAMIC or INTERP headers (for static linked enforcement) ---
+    // This loader only supports statically linked executables.
+    Elf32_Phdr *current_phdr_check = (Elf32_Phdr *)((char *)map_start_for_headers + elf_header->e_phoff);
+    for (int i = 0; i < elf_header->e_phnum; ++i) {
+        if (current_phdr_check->p_type == PT_DYNAMIC || current_phdr_check->p_type == PT_INTERP) {
+            fprintf(stderr, "Error: This loader only supports static linked executables. Found %s program header.\n",
+                    get_phdr_type_string(current_phdr_check->p_type));
+            munmap(map_start_for_headers, st.st_size); // Clean up temporary mapping
+            close(fd);                                   // Close file descriptor
+            return EXIT_FAILURE;                         // Terminate loader
+        }
+        current_phdr_check = (Elf32_Phdr *)((char *)current_phdr_check + elf_header->e_phentsize);
+    }
+
+    printf("--- Task 2b: Mapping PT_LOAD segments ---\n");
+    // Iterate through program headers again, this time to map the PT_LOAD segments
+    foreach_phdr(map_start_for_headers, loader_map_callback, 0);
+    printf("----------------------------------------\n\n");
+
+    printf("--- Transferring Control ---\n");
+    // Transfer control to the loaded ELF. This function will call startup.s.
+    execute_loaded_elf(elf_header, argc, argv);
+    printf("----------------------------\n");
+
+    // Cleanup resources. These lines are generally unreachable if `execute_loaded_elf`
+    // successfully transfers control (via a `jmp` in `startup.s`) or `exit()`s.
+    // They are primarily for error paths where execution returns to main.
+    if (map_start_for_headers != MAP_FAILED) {
+        if (munmap(map_start_for_headers, st.st_size) == -1) {
+            perror("Error unmapping temporary header map");
+        }
+    }
+    if (fd != -1) {
+        if (close(fd) == -1) {
+            perror("Error closing ELF file descriptor");
+        }
+    }
+
+    return EXIT_SUCCESS; // Should only be reached if an error occurs earlier and `exit()` is not called.
+}
