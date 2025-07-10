@@ -32,7 +32,7 @@
 #include <stdlib.h>   // For exit, EXIT_FAILURE, EXIT_SUCCESS
 #include <string.h>   // For memcmp, memset
 #include <sys/types.h> // For open, off_t
-#include <sys/stat.h> // For stat64, fstat64
+#include <sys/stat.h> // For stat, fstat (not stat64, fstat64)
 #include <fcntl.h>    // For open, O_RDONLY
 #include <sys/mman.h> // For mmap, munmap, PROT_*, MAP_*
 #include <unistd.h>   // For close, size_t, sysconf(_SC_PAGESIZE)
@@ -40,12 +40,6 @@
 // Ensure we have Elf32_Phdr and Elf32_Ehdr definitions.
 // On Linux, these are typically in <elf.h>.
 #include <elf.h>
-
-// To enable 64-bit file offsets on 32-bit systems,
-// define _FILE_OFFSET_BITS to 64 before including any headers.
-#ifndef _FILE_OFFSET_BITS
-#define _FILE_OFFSET_BITS 64
-#endif
 
 // Define a common stack size for the loaded program
 #define LOADER_STACK_SIZE 0x100000 // 1MB for the loaded program's stack
@@ -152,14 +146,14 @@ void print_readelf_phdr_info(Elf32_Phdr *phdr, int index) {
  * Parameters:
  *   map_start - Base address where the ELF file is mapped.
  *   func      - Callback function to apply to each program header.
- *   arg       - Additional argument for the callback (not used in current task).
+ *   arg       - Additional argument for the callback 
  *
  * Returns:
  *   0 on success, or -1 on error.
  */
 int foreach_phdr(void *map_start, void (*func)(Elf32_Phdr *, int), int arg) {
     Elf32_Ehdr *elf_header = (Elf32_Ehdr *)map_start;
-
+// Check if the ELF header is valid
     if (memcmp(elf_header->e_ident, ELFMAG, SELFMAG) != 0) {
         fprintf(stderr, "Error: Not an ELF file (bad magic number).\n");
         return -1;
@@ -173,16 +167,17 @@ int foreach_phdr(void *map_start, void (*func)(Elf32_Phdr *, int), int arg) {
         return -1;
     }
 
-    Elf32_Off phoff = elf_header->e_phoff;
-    Elf32_Half phnum = elf_header->e_phnum;
-    Elf32_Half phentsize = elf_header->e_phentsize;
+    Elf32_Off phoff = elf_header->e_phoff; // Program header offset
+    Elf32_Half phnum = elf_header->e_phnum; // Number of program headers
+    Elf32_Half phentsize = elf_header->e_phentsize; // Size of each program header
 
     if (phnum == 0) {
         fprintf(stderr, "Warning: No program headers found in the ELF file.\n");
         return 0;
     }
 
-    Elf32_Phdr *current_phdr = (Elf32_Phdr *)((char *)map_start + phoff);
+    Elf32_Phdr *current_phdr = (Elf32_Phdr *)((char *)map_start + phoff); // Start of program headers 
+    // Iterate through each program header and apply the callback function
     for (int i = 0; i < phnum; ++i) {
         func(current_phdr, i);
         current_phdr = (Elf32_Phdr *)((char *)current_phdr + phentsize);
@@ -334,7 +329,7 @@ int main(int argc, char *argv[]) {
 
     const char *file_path = argv[1];
     int fd = -1;
-    struct stat64 st;
+    struct stat st;  // Changed from struct stat64
     void *map_start_for_headers = NULL;
 
     fd = open(file_path, O_RDONLY);
@@ -344,7 +339,7 @@ int main(int argc, char *argv[]) {
     }
     g_target_elf_fd = fd;
 
-    if (fstat64(fd, &st) == -1) {
+    if (fstat(fd, &st) == -1) {  // Changed from fstat64
         perror("Error getting ELF file size");
         return EXIT_FAILURE;
     }
