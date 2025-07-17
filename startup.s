@@ -14,10 +14,17 @@ startup:
     mov     ebx, [ebp+12]   ; argv
     mov     ecx, [ebp+16]   ; entry point
     
-    ; Push arguments for the loaded program's _start function
-    ; The loaded program expects: _start(int argc, char *argv[])
-    push    ebx             ; push argv
-    push    eax             ; push argc
+    ; Set up stack for the loaded program's _start function
+    ; Standard calling convention: arguments pushed right to left
+    ; _start(int argc, char *argv[]) means push argv first, then argc
+    
+    ; Reset stack pointer to set up clean environment
+    mov     esp, ebp
+    pop     ebp
+    
+    ; Push arguments in reverse order for calling convention
+    push    ebx             ; push argv (second parameter)
+    push    eax             ; push argc (first parameter)
     
     ; Jump to the loaded program's entry point
     jmp     ecx
