@@ -1,44 +1,17 @@
-/*
- * loader.c - A 32-bit ELF loader for statically linked executables
- *
- * This file implements a loader that reads a 32-bit ELF executable file,
- * maps its PT_LOAD segments into memory, and transfers control to its entry point.
- *
- * Usage:
- *   ./loader <32bit_ELF_executable_file> [args_for_loaded_program...]
- *
- * The loader performs the following tasks:
- *   - Reads and verifies the ELF header and program headers.
- *   - Prints the program header information.
- *   - Maps the PT_LOAD segments into memory using mmap.
- *   - Prepares a stack for the loaded program.
- *   - Transfers control to the loaded program's entry point via the startup function.
- *
- * Functions provided:
- *   - get_phdr_type_string: Returns a string representation of a program header type.
- *   - print_readelf_phdr_info: Callback function to print a program header's details.
- *   - foreach_phdr: Iterates over each program header in the ELF.
- *   - load_phdr: Maps a PT_LOAD segment into memory.
- *   - loader_map_callback: Wrapper callback to call load_phdr for each program header.
- *   - execute_loaded_elf: Prepares arguments and transfers control to the loaded executable.
- *
- */
-
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
-#include <stdio.h>    // For printf, perror, fprintf
-#include <stdlib.h>   // For exit, EXIT_FAILURE, EXIT_SUCCESS
-#include <string.h>   // For memcmp, memset
-#include <sys/types.h> // For open, off_t
-#include <sys/stat.h> // For stat, fstat
-#include <fcntl.h>    // For open, O_RDONLY
-#include <sys/mman.h> // For mmap, munmap, PROT_*, MAP_*
-#include <unistd.h>   // For close, size_t, sysconf(_SC_PAGESIZE)
+#include <stdio.h>    
+#include <stdlib.h>   
+#include <string.h>   
+#include <sys/types.h> 
+#include <sys/stat.h> 
+#include <fcntl.h>    
+#include <sys/mman.h> 
+#include <unistd.h>   
 
-// Ensure we have Elf32_Phdr and Elf32_Ehdr definitions.
-// On Linux, these are typically in <elf.h>.
+
 #include <elf.h>
 
 // Define a common stack size for the loaded program
@@ -52,9 +25,6 @@ static int g_target_elf_fd = -1;
 
 /*
  * External declaration of the startup function implemented in startup.s.
- *
- * Signature:
- *   void startup(int argc, char **argv, unsigned int entry_point);
  *
  * This function is responsible for transferring control to the loaded program.
  */
