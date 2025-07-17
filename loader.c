@@ -24,7 +24,7 @@
  *
  */
 
-#ifndef _GNU_SOURCE // Enable GNU extensions for stat64, etc.
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
@@ -32,7 +32,7 @@
 #include <stdlib.h>   // For exit, EXIT_FAILURE, EXIT_SUCCESS
 #include <string.h>   // For memcmp, memset
 #include <sys/types.h> // For open, off_t
-#include <sys/stat.h> // For stat, fstat (not stat64, fstat64)
+#include <sys/stat.h> // For stat, fstat
 #include <fcntl.h>    // For open, O_RDONLY
 #include <sys/mman.h> // For mmap, munmap, PROT_*, MAP_*
 #include <unistd.h>   // For close, size_t, sysconf(_SC_PAGESIZE)
@@ -329,7 +329,7 @@ int main(int argc, char *argv[]) {
 
     const char *file_path = argv[1];
     int fd = -1;
-    struct stat st;  // Changed from struct stat64
+    struct stat st;  
     void *map_start_for_headers = NULL;
 
     fd = open(file_path, O_RDONLY);
@@ -339,7 +339,7 @@ int main(int argc, char *argv[]) {
     }
     g_target_elf_fd = fd;
 
-    if (fstat(fd, &st) == -1) {  // Changed from fstat64
+    if (fstat(fd, &st) == -1) {  
         perror("Error getting ELF file size");
         return EXIT_FAILURE;
     }
