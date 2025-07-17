@@ -1,32 +1,43 @@
+section .rodata
+str1:   db "(:^..^:) starting up the code",10,0
+        
 section .text
 global startup:function startup_end - startup
 
 startup:
-    push    ebp
-    mov     ebp, esp
-    
-    ; Arguments: startup(argc, argv, entry_point)
-    ; [ebp+8]  = argc
-    ; [ebp+12] = argv  
-    ; [ebp+16] = entry_point
-    
-    mov     eax, [ebp+8]    ; argc
-    mov     ebx, [ebp+12]   ; argv
-    mov     ecx, [ebp+16]   ; entry point
-    
-    ; Set up stack for the loaded program's _start function
-    ; Standard calling convention: arguments pushed right to left
-    ; _start(int argc, char *argv[]) means push argv first, then argc
-    
-    ; Reset stack pointer to set up clean environment
-    mov     esp, ebp
-    pop     ebp
-    
-    ; Push arguments in reverse order for calling convention
-    push    ebx             ; push argv (second parameter)
-    push    eax             ; push argc (first parameter)
-    
-    ; Jump to the loaded program's entry point
-    jmp     ecx
+        push    ebp             ; Save caller state
+        mov     ebp, esp
+        sub     esp, 4          ; Leave space for local var on stack
+        pushad                  ; Save more registers
+
+        mov     ecx, [ebp+8]    ; Gets argc from C
+        mov     ebx, [ebp+12]   ; Gets argv (char**) from C
+
+        mov     eax, ecx
+        dec     eax             ; skip program name
+        shl     eax, 2          ; eax = 4 * (argc - 1) Push evry char* of argv for _start
+
+.loop1:
+        cmp     eax, 0
+        jl      .done_args
+        mov     edx, ebx
+        add     edx, eax
+        push    dword [edx]
+        sub     eax, 4
+        jmp     .loop1
+
+.done_args:
+        mov     ecx, [ebp+8]    ; Gets argc from C
+        push    ecx             ; Push argc for _start
+
+        mov     ebx, [ebp+16]   ; Gets the function address from C
+        jmp    ebx             ; Jumps to  _start
+
+        mov     [ebp-4], eax    ; Save return value
+        popad                   ; Restore caller state (registers)
+        mov     eax, [ebp-4]    ; Place returned value where caller can see it
+        add     esp, 4          ; Deallocate local variable
+        pop     ebp             ; Restore caller state (ebp)
+        ret			; Back to caller
 
 startup_end:
